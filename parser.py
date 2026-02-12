@@ -16,7 +16,7 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass, asdict
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PlaywrightTimeoutError
 
@@ -52,6 +52,7 @@ class DiscordMetrics:
 @dataclass
 class XMetrics:
     followers: Optional[str] = None
+    following: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -69,6 +70,149 @@ class HexMetrics:
 
 def clean_spaces(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
+
+
+def _clean_ws(value: str) -> str:
+    return clean_spaces(value)
+
+
+def parse_compact_number(value: str) -> Optional[str]:
+    value = _clean_ws(value or "")
+    if not value:
+        return None
+
+    match = re.search(r"\d[\d\s\u00a0.,]*(?:\s*(?:k|m|тыс\.?|млн\.?))?", value, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    token = _clean_ws(match.group(0)).replace(" ", "")
+    token = token.replace("\u00a0", "")
+    lower = token.lower()
+
+    multiplier = 1
+    if lower.endswith("k"):
+        multiplier = 1_000
+        token = token[:-1]
+    elif lower.endswith("m"):
+        multiplier = 1_000_000
+        token = token[:-1]
+    elif lower.endswith("тыс") or lower.endswith("тыс."):
+        multiplier = 1_000
+        token = re.sub(r"тыс\.?$", "", token, flags=re.IGNORECASE)
+    elif lower.endswith("млн") or lower.endswith("млн."):
+        multiplier = 1_000_000
+        token = re.sub(r"млн\.?$", "", token, flags=re.IGNORECASE)
+
+    token = token.strip().replace(",", ".")
+    if token.count(".") > 1:
+        token = token.replace(".", "")
+
+    try:
+        number = float(token)
+    except ValueError:
+        digits = re.sub(r"\D", "", token)
+        return digits or None
+
+    return str(int(number * multiplier))
+
+
+def parse_poc_timer(value: str) -> Optional[str]:
+    value = _clean_ws(value or "")
+    if not value:
+        return None
+
+    hour = re.search(r"(\d+)\s*h", value, flags=re.IGNORECASE)
+    minute = re.search(r"(\d+)\s*m", value, flags=re.IGNORECASE)
+    second = re.search(r"(\d+)\s*s", value, flags=re.IGNORECASE)
+
+    if not any([hour, minute, second]):
+        return None
+
+    parts = []
+    if hour:
+        parts.append(f"{hour.group(1)}h")
+    if minute:
+        parts.append(f"{minute.group(1)}m")
+    if second:
+        parts.append(f"{second.group(1)}s")
+    return " ".join(parts)
+
+
+async def _extract_card_text_by_label(page: Page, label: str) -> Optional[str]:
+    js = """
+    ([label]) => {
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+      const wanted = norm(label).toLowerCase();
+
+      const all = Array.from(document.querySelectorAll("*"));
+      const labelEl = all.find((el) => norm(el.textContent).toLowerCase() === wanted);
+      if (!labelEl) return null;
+
+      let el = labelEl;
+      for (let depth = 0; depth < 12 && el; depth++) {
+        const t = norm(el.textContent);
+        const without = t.replace(new RegExp(wanted, "ig"), "").trim();
+
+        if (without && /\d/.test(without)) {
+          if (el.tagName && el.tagName.toLowerCase() !== "body") {
+            return el.textContent;
+          }
+        }
+        el = el.parentElement;
+      }
+
+      return (labelEl.parentElement ? labelEl.parentElement.textContent : labelEl.textContent) || null;
+    }
+    """
+    raw = await page.evaluate(js, [label])
+    if not raw:
+        return None
+    return _clean_ws(raw)
+
+
+async def parse_gonka_validator_dashboard(page: Page) -> Dict[str, Any]:
+    labels = {
+        "next_poc": "Next PoC",
+        "total_compute_power": "Total Compute Power",
+        "validators": "Validators",
+        "previous_epoch_reward": "Previous Epoch Reward",
+        "current_epoch_reward": "Current Epoch Reward",
+    }
+
+    out: Dict[str, Any] = {k: None for k in labels.keys()}
+
+    for key, label in labels.items():
+        card_text = await _extract_card_text_by_label(page, label)
+        if not card_text:
+            continue
+
+        cleaned = re.sub(rf"(?i)\b{re.escape(label)}\b", "", card_text).strip()
+        cleaned = _clean_ws(cleaned)
+
+        if key == "next_poc":
+            out[key] = parse_poc_timer(cleaned)
+        else:
+            out[key] = parse_compact_number(cleaned)
+
+    return out
+
+
+async def parse_x_profile_counts(page: Page, url: str, timeout: int = 45_000) -> Dict[str, Optional[str]]:
+    await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    await page.wait_for_selector('a[href$="/following"]', timeout=timeout)
+
+    following_link = page.locator('a[href$="/following"]').first
+    followers_link = page.locator('a[href$="/verified_followers"], a[href$="/followers"]').first
+
+    following_text = (await following_link.get_attribute("aria-label")) or (await following_link.inner_text())
+    followers_text = None
+    if await followers_link.count() > 0:
+        followers_text = (await followers_link.get_attribute("aria-label")) or (await followers_link.inner_text())
+
+    return {
+        "following": parse_compact_number(following_text or ""),
+        "followers": parse_compact_number(followers_text or ""),
+    }
 
 
 def find_near_label(text: str, label_regex: str, value_regex: str, window: int = 120) -> Optional[str]:
@@ -101,39 +245,21 @@ async def goto_soft(page: Page, url: str, timeout_ms: int = 15000) -> tuple[bool
 
 
 async def parse_node(page: Page, url: str) -> NodeMetrics:
-    ok, err = await goto_soft(page, url)
+    node_url = f"{url}/dashboard/gonka/validator"
+    ok, err = await goto_soft(page, node_url, timeout_ms=60000)
     if not ok:
         return NodeMetrics(url=url, available=False, error=err)
 
     await page.wait_for_selector("text=Total Compute Power", timeout=15000)
     await page.wait_for_timeout(2000)
-
-    total = await page.evaluate(
-        """
-        () => {
-          const labels = [...document.querySelectorAll('[data-value="Total Compute Power"]')];
-          for (const label of labels) {
-            const card = label.closest('div[class*="bg-base-100"]') || label.closest('div');
-            if (!card) continue;
-            const valueSpan = card.querySelector('h6 [data-value]');
-            const value = valueSpan?.getAttribute('data-value') || valueSpan?.textContent;
-            if (value) return value;
-          }
-          return null;
-        }
-        """
-    )
-
-    text = clean_spaces(await page.inner_text("body"))
-    validators = find_near_label(text, r"Validators|Валидатор\w*", r"\d{1,8}")
-    next_poc = find_near_label(text, r"Next\s*PoC", r"\d+\s*h\s*\d+\s*m\s*\d+\s*s", window=200)
+    stats = await parse_gonka_validator_dashboard(page)
 
     return NodeMetrics(
         url=url,
         available=True,
-        total_compute_power=clean_spaces(total) if total else None,
-        validators=validators,
-        next_poc=next_poc,
+        total_compute_power=stats["total_compute_power"],
+        validators=stats["validators"],
+        next_poc=stats["next_poc"],
     )
 
 
@@ -142,7 +268,7 @@ async def parse_discord(page: Page) -> DiscordMetrics:
     if not ok:
         return DiscordMetrics(error=err)
 
-    await page.wait_for_selector("text=/в\s*сети|online/i", timeout=20000)
+    await page.wait_for_selector(r"text=/в\s*сети|online/i", timeout=20000)
     await page.wait_for_timeout(2000)
     html = await page.content()
     text = clean_spaces(await page.inner_text("body"))
@@ -158,28 +284,11 @@ async def parse_discord(page: Page) -> DiscordMetrics:
 
 
 async def parse_x(page: Page) -> XMetrics:
-    ok, err = await goto_soft(page, X_URL, timeout_ms=30000)
-    if not ok:
-        return XMetrics(error=err)
-
-    await page.wait_for_timeout(3500)
-    content = await page.content()
-    text = clean_spaces(await page.inner_text("body"))
-    combined = f"{text} {content}"
-
-    followers = None
-    patterns = [
-        r"(\d[\d\s.,]*\s*(?:тыс\.?|k|m)?)\s*(?:читател\w+|followers?)",
-        r"verified_followers[^<]{0,500}?>(\d[\d\s.,\u00a0]*\s*(?:тыс\.?|k|m)?)<",
-        r"followers_count\D{0,20}(\d[\d\s.,]*)",
-    ]
-    for p in patterns:
-        m = re.search(p, combined, flags=re.IGNORECASE)
-        if m:
-            followers = clean_spaces(m.group(1))
-            break
-
-    return XMetrics(followers=followers)
+    try:
+        x_stats = await parse_x_profile_counts(page, X_URL)
+        return XMetrics(followers=x_stats["followers"], following=x_stats["following"])
+    except Exception as exc:
+        return XMetrics(error=str(exc))
 
 
 async def parse_github(page: Page) -> GitHubMetrics:
@@ -316,6 +425,7 @@ def print_report(data: dict) -> None:
 
     print("\n[X / Twitter]")
     print(f"- Followers: {data['x'].get('followers')}")
+    print(f"- Following: {data['x'].get('following')}")
     if data["x"].get("error"):
         print(f"- Error: {data['x']['error']}")
 
