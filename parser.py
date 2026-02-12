@@ -22,15 +22,8 @@ from playwright.async_api import async_playwright, Browser, Page, TimeoutError a
 
 
 NODE_URLS = [
-    "http://185.216.21.98:8000",
-    "http://36.189.234.197:18026",
-    "http://36.189.234.237:17241",
     "http://node1.gonka.ai:8000",
     "http://node2.gonka.ai:8000",
-    "http://node3.gonka.ai:8000",
-    "http://47.236.26.199:8000",
-    "http://47.236.19.22:18000",
-    "http://gonka.spv.re:8000",
 ]
 
 DISCORD_URL = "https://discord.com/invite/RADwCT2U6R"
@@ -112,22 +105,33 @@ async def parse_node(page: Page, url: str) -> NodeMetrics:
     if not ok:
         return NodeMetrics(url=url, available=False, error=err)
 
-    await page.wait_for_timeout(1500)
-    text = clean_spaces(await page.inner_text("body"))
+    await page.wait_for_selector("text=Total Compute Power", timeout=15000)
+    await page.wait_for_timeout(2000)
 
-    total = find_near_label(text, r"Total\s*Compute\s*Power|ОБЩИЙ\s*ВЕС", r"\d[\d\s]{1,20}")
-    validators = find_near_label(text, r"Validators|УЧАСТНИКИ", r"\d{1,6}")
-    next_poc = find_near_label(
-        text,
-        r"Next\s*PoC",
-        r"\d+\s*h\s*\d+\s*m\s*\d+\s*s|\d+\s*час\S*\s*\d+\s*мин\S*\s*\d+\s*с",
-        window=200,
+    total = await page.evaluate(
+        """
+        () => {
+          const labels = [...document.querySelectorAll('[data-value="Total Compute Power"]')];
+          for (const label of labels) {
+            const card = label.closest('div[class*="bg-base-100"]') || label.closest('div');
+            if (!card) continue;
+            const valueSpan = card.querySelector('h6 [data-value]');
+            const value = valueSpan?.getAttribute('data-value') || valueSpan?.textContent;
+            if (value) return value;
+          }
+          return null;
+        }
+        """
     )
+
+    text = clean_spaces(await page.inner_text("body"))
+    validators = find_near_label(text, r"Validators|Валидатор\w*", r"\d{1,8}")
+    next_poc = find_near_label(text, r"Next\s*PoC", r"\d+\s*h\s*\d+\s*m\s*\d+\s*s", window=200)
 
     return NodeMetrics(
         url=url,
         available=True,
-        total_compute_power=total,
+        total_compute_power=clean_spaces(total) if total else None,
         validators=validators,
         next_poc=next_poc,
     )
@@ -138,12 +142,14 @@ async def parse_discord(page: Page) -> DiscordMetrics:
     if not ok:
         return DiscordMetrics(error=err)
 
+    await page.wait_for_selector("text=/в\s*сети|online/i", timeout=20000)
     await page.wait_for_timeout(2000)
+    html = await page.content()
     text = clean_spaces(await page.inner_text("body"))
 
-    # Examples: "241 в сети", "836 участников", "241 Online", "836 Members"
-    online_match = re.search(r"(\d[\d\s.,]*)\s*(?:в\s*сети|online)", text, flags=re.IGNORECASE)
-    members_match = re.search(r"(\d[\d\s.,]*)\s*(?:участник\w*|members?)", text, flags=re.IGNORECASE)
+    combined = f"{html} {text}"
+    online_match = re.search(r"(\d[\d\s\u00a0.,]*)\s*(?:в\s*сети|online)", combined, flags=re.IGNORECASE)
+    members_match = re.search(r"(\d[\d\s\u00a0.,]*)\s*(?:участник\w*|members?)", combined, flags=re.IGNORECASE)
 
     online = clean_spaces(online_match.group(1)) if online_match else None
     members = clean_spaces(members_match.group(1)) if members_match else None
@@ -156,7 +162,7 @@ async def parse_x(page: Page) -> XMetrics:
     if not ok:
         return XMetrics(error=err)
 
-    await page.wait_for_timeout(2500)
+    await page.wait_for_timeout(3500)
     content = await page.content()
     text = clean_spaces(await page.inner_text("body"))
     combined = f"{text} {content}"
@@ -164,6 +170,7 @@ async def parse_x(page: Page) -> XMetrics:
     followers = None
     patterns = [
         r"(\d[\d\s.,]*\s*(?:тыс\.?|k|m)?)\s*(?:читател\w+|followers?)",
+        r"verified_followers[^<]{0,500}?>(\d[\d\s.,\u00a0]*\s*(?:тыс\.?|k|m)?)<",
         r"followers_count\D{0,20}(\d[\d\s.,]*)",
     ]
     for p in patterns:
